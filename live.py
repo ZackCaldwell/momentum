@@ -12,10 +12,8 @@ from email.message import EmailMessage
 import smtplib
 from dotenv import load_dotenv
 
-
 # Load environment variables from .env file
 load_dotenv()
-
 
 #####################################################################
 # Logging Configuration
@@ -80,7 +78,7 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, 'r') as f:
             state = json.load(f)
-            # Convert string dates back to datetime objects
+            # Convert string dates back to datetime objects with timezone
             state['position_entry_dates'] = {k: pd.to_datetime(v) for k, v in state.get('position_entry_dates', {}).items()}
             return state
     return {"entry_prices": {}, "position_entry_dates": {}}
@@ -88,7 +86,7 @@ def load_state():
 def save_state(state):
     """Save trading state to a JSON file."""
     state_to_save = state.copy()
-    # Convert datetime objects to strings for JSON serialization
+    # Convert datetime objects to ISO format strings
     state_to_save['position_entry_dates'] = {k: v.isoformat() for k, v in state.get('position_entry_dates', {}).items()}
     with open(STATE_FILE, 'w') as f:
         json.dump(state_to_save, f, indent=4)
@@ -327,10 +325,10 @@ def get_rebalance_dates(close_prices, freq=REBALANCE_FREQ):
     # Map common frequency codes to pandas period frequencies
     freq_map = {
         'W': 'W-MON',  # Weekly on Monday
-        'MS': 'M',  # Monthly Start
-        'QS': 'Q',  # Quarterly Start
-        'AS': 'A',  # Annually Start
-        'YS': 'A'  # Another Annually Start alias
+        'MS': 'M',      # Monthly Start
+        'QS': 'Q',      # Quarterly Start
+        'AS': 'A',      # Annually Start
+        'YS': 'A'       # Another Annually Start alias
     }
 
     # Get the corresponding pandas frequency string, default to monthly if unknown
@@ -351,12 +349,6 @@ def get_rebalance_dates(close_prices, freq=REBALANCE_FREQ):
     return rebal_dates
 
 #####################################################################
-# Strategy Logic (Reused from Backtest)
-#####################################################################
-
-# (Functions already included above: calculate_momentum, select_stocks, volatility_scale, rebalance_portfolio, get_rebalance_dates)
-
-#####################################################################
 # Live Trading Functions
 #####################################################################
 
@@ -369,6 +361,7 @@ def get_current_positions():
             positions[pos.symbol] = int(float(pos.qty))
     except Exception as e:
         logger.error(f"Error fetching positions: {e}")
+        send_email("Trading Bot Error", f"Error fetching positions: {e}")
     return positions
 
 def get_account_cash():
@@ -379,6 +372,7 @@ def get_account_cash():
         return cash
     except Exception as e:
         logger.error(f"Error fetching account cash: {e}")
+        send_email("Trading Bot Error", f"Error fetching account cash: {e}")
         return 0.0
 
 def place_order(symbol, qty, side, order_type='market', time_in_force='day'):
@@ -547,10 +541,12 @@ def main():
 
     while True:
         try:
+            # Define the timezone for Eastern Time (ET)
+            eastern = datetime.timezone(datetime.timedelta(hours=-5))  # Note: This does not account for daylight saving
+
             # Get current time in US Eastern Time
-            eastern = datetime.timezone(datetime.timedelta(hours=-5))  # Adjust for daylight saving if needed
             now = datetime.datetime.now(tz=eastern)
-            current_date = pd.Timestamp(now.date())
+            current_date = pd.Timestamp(now)  # Remove the tz parameter since 'now' is already tz-aware
 
             logger.info(f"Current date: {current_date.date()}")
 
@@ -561,6 +557,7 @@ def main():
             # Sleep until next day at 6 PM ET to ensure all market data is available
             # Calculate seconds until next day at 6 PM ET
             next_run = datetime.datetime.combine(now.date() + datetime.timedelta(days=1), datetime.time(18, 0, 0))
+            next_run = next_run.replace(tzinfo=eastern)  # Ensure next_run is timezone-aware
             seconds_until_next_run = (next_run - now).total_seconds()
             if seconds_until_next_run < 0:
                 seconds_until_next_run += 86400  # Add a day in seconds
