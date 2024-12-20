@@ -10,6 +10,11 @@ import matplotlib.pyplot as plt
 import alpaca_trade_api as tradeapi
 from email.message import EmailMessage
 import smtplib
+from dotenv import load_dotenv
+
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 #####################################################################

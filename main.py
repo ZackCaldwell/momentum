@@ -7,6 +7,12 @@ import matplotlib.pyplot as plt
 import alpaca_trade_api as tradeapi
 import logging
 
+from dotenv import load_dotenv
+
+
+# Load environment variables from .env file
+load_dotenv()
+
 #####################################################################
 # Logging Configuration
 #####################################################################
@@ -17,8 +23,8 @@ logger = logging.getLogger(__name__)
 # Configuration
 #####################################################################
 
-ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "PKQVB7QOOM5LZTRTJZAU")
-ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "Mnf9pzDriHWdasHMo2gByxRDu60qa0hCUhccb0A1")
+ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = "https://paper-api.alpaca.markets"
 
 LOOKBACK_PERIOD = 42
