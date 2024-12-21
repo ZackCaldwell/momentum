@@ -138,7 +138,7 @@ def get_bars(api, symbols, start_date, end_date, timeframe='1Day'):
 
         logger.debug(f"Fetching bars for chunk {idx}/{len(symbol_chunks)}: {chunk}")
         try:
-            bars = api.get_bars(chunk, timeframe, start=start_str, end=end_str, adjustment='raw').df
+            bars = api.get_bars(chunk, timeframe, start=start_str, end=end_str, adjustment='split').df
         except Exception as e:
             logger.error(f"Error fetching bars for chunk {idx}: {e}")
             continue

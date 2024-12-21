@@ -9,7 +9,6 @@ import logging
 
 from dotenv import load_dotenv
 
-
 # Load environment variables from .env file
 load_dotenv()
 
@@ -48,7 +47,6 @@ MIN_HOLD_DAYS = 30  # Minimum holding period in days
 
 MARKET_REGIME_SYMBOL = 'SPY'
 
-
 #####################################################################
 # Data Fetching and Universe Selection
 #####################################################################
@@ -72,40 +70,44 @@ def get_bars(api, symbols, start_date, end_date, timeframe='1Day'):
             continue
 
         logger.debug(f"Fetching bars for chunk {idx}/{len(symbol_chunks)}: {chunk}")
-        bars = api.get_bars(chunk, timeframe, start=start_str, end=end_str, adjustment='raw')
-        df = bars.df
+        try:
+            bars = api.get_bars(chunk, timeframe, start=start_str, end=end_str, adjustment='split')
+            df = bars.df
 
-        if df is None or df.empty:
-            logger.debug(f"No data returned for chunk {idx}")
-            continue
+            if df is None or df.empty:
+                logger.debug(f"No data returned for chunk {idx}")
+                continue
 
-        if 'symbol' not in df.index.names:
-            # Try to fix the index if possible (omitted for brevity, same logic as before)
-            if 'symbol' in df.columns:
-                if 'timestamp' not in df.columns:
-                    if 'timestamp' in df.index.names:
-                        df = df.reset_index()
-                if 'symbol' in df.columns and 'timestamp' in df.columns:
-                    df = df.set_index(['symbol', 'timestamp']).sort_index()
-                else:
-                    if len(chunk) == 1:
-                        sym = chunk[0]
-                        if df.index.name == 'timestamp':
-                            df['symbol'] = sym
-                            df = df.reset_index().set_index(['symbol', 'timestamp']).sort_index()
-                        else:
-                            logger.warning("No suitable timestamp column found for single-symbol fallback.")
-                            continue
+            if 'symbol' not in df.index.names:
+                # Try to fix the index if possible
+                if 'symbol' in df.columns:
+                    if 'timestamp' not in df.columns:
+                        if 'timestamp' in df.index.names:
+                            df = df.reset_index()
+                    if 'symbol' in df.columns and 'timestamp' in df.columns:
+                        df = df.set_index(['symbol', 'timestamp']).sort_index()
                     else:
-                        logger.warning(
-                            "Multiple symbols requested but no 'symbol' and 'timestamp' columns after reset.")
-                        continue
+                        if len(chunk) == 1:
+                            sym = chunk[0]
+                            if df.index.name == 'timestamp':
+                                df['symbol'] = sym
+                                df = df.reset_index().set_index(['symbol', 'timestamp']).sort_index()
+                            else:
+                                logger.warning("No suitable timestamp column found for single-symbol fallback.")
+                                continue
+                        else:
+                            logger.warning("Multiple symbols requested but no 'symbol' and 'timestamp' columns after reset.")
+                            continue
 
-        if 'symbol' not in df.index.names or 'timestamp' not in df.index.names:
-            logger.warning("Unable to set multi-index. Data may not be usable.")
+            if 'symbol' not in df.index.names or 'timestamp' not in df.index.names:
+                logger.warning("Unable to set multi-index. Data may not be usable.")
+                continue
+
+            all_data.append(df)
+
+        except Exception as e:
+            logger.error(f"Error fetching data for chunk {idx}: {e}")
             continue
-
-        all_data.append(df)
 
     if not all_data:
         logger.debug("No bars data collected.")
@@ -113,6 +115,7 @@ def get_bars(api, symbols, start_date, end_date, timeframe='1Day'):
 
     data = pd.concat(all_data)
     data = data.sort_index()
+    logger.debug(f"Total data fetched: {data.shape[0]} rows and {data.shape[1]} columns.")
     return data
 
 
@@ -126,13 +129,16 @@ def get_universe(api, start_date, end_date, universe_size=UNIVERSE_SIZE, min_avg
     start_universe_str = start_dt.strftime('%Y-%m-%d')
     end_universe_str = end_dt.strftime('%Y-%m-%d')
 
+    logger.debug(f"Fetching bars for universe selection from {start_universe_str} to {end_universe_str}.")
     barset = get_bars(api, symbols, start_universe_str, end_universe_str, timeframe='1Day')
     if barset.empty:
+        logger.warning("No bars data fetched for universe selection.")
         return []
 
     avg_vol = barset.groupby(level=0)['volume'].mean()
     liquid_symbols = avg_vol[avg_vol > min_avg_vol].index.tolist()
     if len(liquid_symbols) == 0:
+        logger.warning("No liquid symbols found based on average volume criteria.")
         return []
 
     last_day_data = barset.groupby(level=0).tail(1)
@@ -141,10 +147,12 @@ def get_universe(api, start_date, end_date, universe_size=UNIVERSE_SIZE, min_avg
     viable_symbols = viable.get_level_values(0).unique()
     liquid_symbols = list(set(liquid_symbols).intersection(set(viable_symbols)))
     if len(liquid_symbols) == 0:
+        logger.warning("No symbols passed the price filter.")
         return []
 
     avg_vol_filtered = avg_vol.loc[liquid_symbols].sort_values(ascending=False)
     selected = avg_vol_filtered.head(universe_size).index.tolist()
+    logger.debug(f"Selected {len(selected)} symbols for the universe based on volume and price criteria.")
     return [str(sym) for sym in selected]
 
 
@@ -209,11 +217,23 @@ def select_stocks(prices, n=NUM_STOCKS, lookback=LOOKBACK_PERIOD):
 
 
 def volatility_scale(prices, selected_stocks, lookback=LOOKBACK_PERIOD):
+    """
+    Scale the target weights based on inverse volatility.
+
+    Parameters:
+    - prices (pd.DataFrame): Historical price data.
+    - selected_stocks (list): List of selected stock symbols.
+    - lookback (int): Number of periods to look back for volatility calculation.
+
+    Returns:
+    - weights (dict): Dictionary of target weights for each selected stock.
+    """
     returns = prices[selected_stocks].pct_change().dropna()
     recent_returns = returns.tail(lookback)
     vol = recent_returns.std() * np.sqrt(252)
     vol = vol.replace({0: np.nan}).dropna()
     if vol.empty:
+        # If volatility is zero for all, assign equal weights
         return {s: 1.0 / len(selected_stocks) for s in selected_stocks}
     inv_vol = 1 / vol
     weights = inv_vol / inv_vol.sum()
@@ -307,10 +327,10 @@ def get_rebalance_dates(close_prices, freq=REBALANCE_FREQ):
     # Map common frequency codes to pandas period frequencies
     freq_map = {
         'W': 'W-MON',  # Weekly on Monday
-        'MS': 'M',  # Monthly Start
-        'QS': 'Q',  # Quarterly Start
-        'AS': 'A',  # Annually Start
-        'YS': 'A'  # Another Annually Start alias
+        'MS': 'M',      # Monthly Start
+        'QS': 'Q',      # Quarterly Start
+        'AS': 'A',      # Annually Start
+        'YS': 'A'       # Another Annually Start alias
     }
 
     # Get the corresponding pandas frequency string, default to monthly if unknown
@@ -341,23 +361,57 @@ def backtest(api, start_date=START_DATE, end_date=END_DATE):
                             min_price=MIN_PRICE)
     if not universe:
         logger.warning("No universe selected.")
-        return None, []
+        return None, [], []
 
     logger.info(f"Universe selected: {len(universe)} symbols.")
 
     prices_data = get_bars(api, universe, start_date, end_date, timeframe='1Day')
     if prices_data.empty:
         logger.warning("No data fetched for selected universe.")
-        return None, []
+        return None, [], []
 
-    close_prices = prices_data['close'].unstack(level=0)
+    # Attempt to extract 'close' prices
+    try:
+        close_prices = prices_data['close'].unstack(level=0)
+    except KeyError:
+        logger.error("'close' column not found in prices_data.")
+        return None, [], []
+
     close_prices = close_prices.dropna(axis=1, how='all')
+
+    # **Fix Applied Here: Correctly reset MultiIndex if present**
+    if isinstance(close_prices.index, pd.MultiIndex):
+        # Correctly check if both 'symbol' and 'timestamp' are in the index names
+        if 'symbol' in close_prices.index.names and 'timestamp' in close_prices.index.names:
+            close_prices = close_prices.reset_index(level='symbol', drop=True)
+            logger.debug("Reset MultiIndex to have timestamp as index.")
+        else:
+            logger.warning("MultiIndex does not contain both 'symbol' and 'timestamp'. Unable to reset index properly.")
+            return None, [], []
+
+    # Verify that the index is now single-level
+    if isinstance(close_prices.index, pd.MultiIndex):
+        logger.error("Failed to reset MultiIndex. 'close_prices' still has a MultiIndex.")
+        return None, [], []
+    else:
+        logger.debug("close_prices has a single-level DateTimeIndex.")
+        logger.debug(f"close_prices index type: {type(close_prices.index)}")
+        logger.debug(f"close_prices index name: {close_prices.index.name}")
+        assert isinstance(close_prices.index, pd.DatetimeIndex), "Index is not a DateTimeIndex."
+
+    close_prices = close_prices.dropna(axis=1, how='all')
+
+    # Log the structure of close_prices
+    logger.debug(f"close_prices type: {type(close_prices)}")
+    logger.debug(f"close_prices columns: {close_prices.columns.tolist()}")
+    logger.debug(f"close_prices head:\n{close_prices.head()}")
 
     universe = close_prices.columns.tolist()
     logger.info(f"{len(universe)} symbols remain after filtering.")
 
     if len(universe) == 0:
-        return None, []
+        logger.warning("No symbols remain after filtering.")
+        return None, [], []
 
     rebal_dates = get_rebalance_dates(close_prices, REBALANCE_FREQ)
     logger.debug(f"Rebalance dates: {rebal_dates}")
@@ -365,11 +419,12 @@ def backtest(api, start_date=START_DATE, end_date=END_DATE):
     cash = INITIAL_CASH
     positions = {}
     portfolio_history = []
-    entry_prices = {}
+    entry_prices = {}  # Average cost per share for each symbol
     position_entry_dates = {}
 
-    # Initialize trade log
-    trade_log = []  # List to store individual trades
+    # Initialize trade logs
+    trade_log = []  # For position entry/exit summaries
+    execution_log = []  # For detailed trade executions
 
     logger.info("Starting portfolio simulation.")
     for i in range(len(close_prices)):
@@ -410,79 +465,153 @@ def backtest(api, start_date=START_DATE, end_date=END_DATE):
                     if sym not in current_prices.index or np.isnan(current_prices[sym]):
                         logger.debug(f"No price data for {sym} today, skipping trade.")
                         continue
+
+                    # Enhanced Logging: Log the current price before executing the trade
+                    logger.debug(f"Executing trade for {sym} on {current_date}: Current Price = {current_prices[sym]}")
+
                     trade_price = current_prices[sym]
                     trade_price *= (1 + SLIPPAGE_BPS / 10000.0) if shares_delta > 0 else (1 - SLIPPAGE_BPS / 10000.0)
-                    trade_cost = shares_delta * trade_price + COMMISSION_PER_TRADE
-                    if cash - trade_cost < 0:
-                        max_shares = int(cash / trade_price)
-                        if max_shares <= 0:
-                            logger.debug(f"Not enough cash for {sym}. Skipping.")
-                            continue
-                        trade_cost = max_shares * trade_price + COMMISSION_PER_TRADE
-                        shares_delta = max_shares if shares_delta > 0 else -max_shares
-                    cash -= trade_cost
-                    old_shares = positions.get(sym, 0)
-                    new_shares = old_shares + shares_delta
-                    positions[sym] = new_shares
-                    if new_shares == 0:
-                        if sym in entry_prices:
-                            # Record the exit of a trade
-                            exit_price = trade_price
-                            entry_price = entry_prices[sym]
-                            entry_date = position_entry_dates[sym]
-                            profit = (exit_price - entry_price) * old_shares
-                            trade_log.append({
-                                'symbol': sym,
-                                'entry_date': entry_date,
-                                'exit_date': current_date,
-                                'entry_price': entry_price,
-                                'exit_price': exit_price,
-                                'shares': old_shares,
-                                'profit': profit
-                            })
-                            del entry_prices[sym]
-                        if sym in position_entry_dates:
-                            del position_entry_dates[sym]
-                    else:
-                        if old_shares == 0 and shares_delta > 0:
+
+                    # Log the adjusted trade price
+                    logger.debug(f"Adjusted Trade Price for {sym}: {trade_price}")
+
+                    if shares_delta > 0:
+                        # Buy
+                        trade_cost = shares_delta * trade_price + COMMISSION_PER_TRADE
+                        if cash - trade_cost < 0:
+                            max_shares = int((cash - COMMISSION_PER_TRADE) / trade_price)
+                            if max_shares <= 0:
+                                logger.debug(f"Not enough cash for {sym}. Skipping.")
+                                continue
+                            trade_cost = max_shares * trade_price + COMMISSION_PER_TRADE
+                            shares_delta = max_shares
+                            logger.debug(f"Adjusted shares to buy for {sym}: {shares_delta}")
+
+                        cash -= trade_cost
+                        old_shares = positions.get(sym, 0)
+                        new_shares = old_shares + shares_delta
+                        positions[sym] = new_shares
+
+                        # Update average entry price
+                        if old_shares == 0:
                             entry_prices[sym] = trade_price
                             position_entry_dates[sym] = current_date
-                        elif shares_delta > 0:
-                            # For simplicity, update entry price only when increasing position from zero
-                            pass
+                        else:
+                            # Weighted average entry price
+                            entry_prices[sym] = ((entry_prices[sym] * old_shares) + (trade_price * shares_delta)) / new_shares
+
+                        # Record Execution Log
+                        execution_log.append({
+                            'Date': current_date,
+                            'Symbol': sym,
+                            'Action': 'Buy',
+                            'Shares': shares_delta,
+                            'Price': trade_price,
+                            'Commission': COMMISSION_PER_TRADE,
+                            'Total Cost/Proceeds': shares_delta * trade_price + COMMISSION_PER_TRADE,
+                            'Cash After Trade': cash,
+                            'Portfolio Value After Trade': cash + sum(
+                                [positions.get(s, 0) * current_prices.get(s, np.nan) for s in positions if s in current_prices.index])
+                        })
+
+                    elif shares_delta < 0:
+                        # Sell
+                        shares_to_sell = abs(shares_delta)
+                        current_shares = positions.get(sym, 0)
+                        if shares_to_sell > current_shares:
+                            shares_to_sell = current_shares
+
+                        # Calculate profit for the shares being sold
+                        profit_per_share = trade_price - entry_prices.get(sym, 0)
+                        realized_profit = profit_per_share * shares_to_sell
+
+                        # Update positions and cash
+                        trade_proceeds = shares_to_sell * trade_price - COMMISSION_PER_TRADE
+                        cash += trade_proceeds
+                        new_shares = current_shares - shares_to_sell
+                        positions[sym] = new_shares
+
+                        # Record Execution Log
+                        execution_log.append({
+                            'Date': current_date,
+                            'Symbol': sym,
+                            'Action': 'Sell',
+                            'Shares': shares_to_sell,
+                            'Price': trade_price,
+                            'Commission': COMMISSION_PER_TRADE,
+                            'Total Cost/Proceeds': shares_to_sell * trade_price - COMMISSION_PER_TRADE,
+                            'Cash After Trade': cash,
+                            'Portfolio Value After Trade': cash + sum(
+                                [positions.get(s, 0) * current_prices.get(s, np.nan) for s in positions if s in current_prices.index])
+                        })
+
+                        # Record Trade Log for realized profit
+                        trade_log.append({
+                            'Symbol': sym,
+                            'Entry Date': position_entry_dates.get(sym, np.nan),
+                            'Exit Date': current_date,
+                            'Entry Price': entry_prices.get(sym, 0),
+                            'Exit Price': trade_price,
+                            'Shares': shares_to_sell,
+                            'Profit': realized_profit
+                        })
+
+                        if new_shares == 0:
+                            del entry_prices[sym]
+                            del position_entry_dates[sym]
+
                     logger.debug(f"Executed trade for {sym}: {shares_delta} shares at {trade_price}")
 
         portfolio_history.append([current_date, total_equity, cash, pos_value])
 
     # After loop ends, close any open positions at the last price
+    logger.info("Closing any remaining open positions at the end of backtest period.")
     for sym, shares in positions.items():
         if shares != 0 and sym in close_prices.columns:
+            logger.debug(f"Closing position for {sym}: {shares} shares at {close_prices[sym].iloc[-1]}")
             exit_price = close_prices[sym].iloc[-1]
             profit = (exit_price - entry_prices.get(sym, 0)) * shares
             trade_log.append({
-                'symbol': sym,
-                'entry_date': position_entry_dates.get(sym, np.nan),
-                'exit_date': close_prices.index[-1],
-                'entry_price': entry_prices.get(sym, 0),
-                'exit_price': exit_price,
-                'shares': shares,
-                'profit': profit
+                'Symbol': sym,
+                'Entry Date': position_entry_dates.get(sym, np.nan),
+                'Exit Date': close_prices.index[-1],
+                'Entry Price': entry_prices.get(sym, 0),
+                'Exit Price': exit_price,
+                'Shares': shares,
+                'Profit': profit
+            })
+            # Record Execution Log for closing the position
+            execution_log.append({
+                'Date': close_prices.index[-1],
+                'Symbol': sym,
+                'Action': 'Sell',
+                'Shares': shares,
+                'Price': exit_price,
+                'Commission': COMMISSION_PER_TRADE,
+                'Total Cost/Proceeds': shares * exit_price - COMMISSION_PER_TRADE,
+                'Cash After Trade': cash + shares * exit_price - COMMISSION_PER_TRADE,
+                'Portfolio Value After Trade': cash + shares * exit_price - COMMISSION_PER_TRADE
             })
 
-    df_history = pd.DataFrame(portfolio_history, columns=['date', 'equity', 'cash', 'positions_value'])
-    df_history.set_index('date', inplace=True)
+    df_history = pd.DataFrame(portfolio_history, columns=['Date', 'Equity', 'Cash', 'Positions_Value'])
+    df_history.set_index('Date', inplace=True)
     logger.info("Backtest complete.")
 
-    return df_history, trade_log
+    return df_history, trade_log, execution_log
 
+
+#####################################################################
+# Performance Metrics
+#####################################################################
 
 def performance_metrics(df, trade_log, risk_free_rate=0.0):
     logger.debug("Calculating performance metrics.")
+    logger.debug(f"DataFrame columns: {df.columns.tolist()}")  # Verify column names
     df = df.copy()
-    df['returns'] = df['equity'].pct_change().fillna(0)
+    df['returns'] = df['Equity'].pct_change().fillna(0)
 
-    start_val = df['equity'].iloc[0]
-    end_val = df['equity'].iloc[-1]
+    start_val = df['Equity'].iloc[0]
+    end_val = df['Equity'].iloc[-1]
     total_days = (df.index[-1] - df.index[0]).days
     years = total_days / 365.25 if total_days > 0 else np.nan
 
@@ -506,8 +635,8 @@ def performance_metrics(df, trade_log, risk_free_rate=0.0):
     sortino = (annualized_return) / downside_vol if downside_vol != 0 else np.nan
 
     # Max Drawdown
-    running_max = df['equity'].cummax()
-    drawdowns = df['equity'] / running_max - 1
+    running_max = df['Equity'].cummax()
+    drawdowns = df['Equity'] / running_max - 1
     max_dd = drawdowns.min()
 
     # Calmar Ratio
@@ -528,14 +657,33 @@ def performance_metrics(df, trade_log, risk_free_rate=0.0):
 
     # Win rate and profit factor
     if total_trades > 0:
-        profitable_trades = [trade for trade in trade_log if trade['profit'] > 0]
+        profitable_trades = [trade for trade in trade_log if trade['Profit'] > 0]
         win_rate = len(profitable_trades) / total_trades
-        gross_profit = sum([trade['profit'] for trade in profitable_trades])
-        gross_loss = sum([-trade['profit'] for trade in trade_log if trade['profit'] < 0])
+        gross_profit = sum([trade['Profit'] for trade in profitable_trades])
+        gross_loss = sum([-trade['Profit'] for trade in trade_log if trade['Profit'] < 0])
         profit_factor = gross_profit / gross_loss if gross_loss != 0 else np.nan
     else:
         win_rate = np.nan
         profit_factor = np.nan
+
+    # Average Trade Profit/Loss
+    if total_trades > 0:
+        average_profit = sum([trade['Profit'] for trade in trade_log]) / total_trades
+    else:
+        average_profit = np.nan
+
+    # Realized vs Portfolio Profit Validation
+    total_realized_profit = sum(trade['Profit'] for trade in trade_log)
+    total_portfolio_profit = end_val - start_val
+
+    logger.debug(f"Total Realized Profit: {total_realized_profit}")
+    logger.debug(f"Total Portfolio Profit: {total_portfolio_profit}")
+
+    discrepancy = abs(total_realized_profit - total_portfolio_profit)
+    if discrepancy > 1e-2:
+        logger.warning(f"Discrepancy detected: Realized Profit ({total_realized_profit}) != Portfolio Profit ({total_portfolio_profit})")
+    else:
+        logger.info("Trade log and portfolio profit are consistent.")
 
     return {
         'Total Return': total_return,
@@ -548,8 +696,10 @@ def performance_metrics(df, trade_log, risk_free_rate=0.0):
         'Max Drawdown Duration (days)': max_dd_duration,
         'Total Trades': total_trades,
         'Win Rate': win_rate,
-        'Profit Factor': profit_factor
+        'Profit Factor': profit_factor,
+        'Average Trade Profit/Loss': average_profit  # Optional
     }
+
 
 
 #####################################################################
@@ -558,27 +708,35 @@ def performance_metrics(df, trade_log, risk_free_rate=0.0):
 
 if __name__ == "__main__":
     logger.info("Initializing Alpaca API.")
-    api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
-    results, trades = backtest(api, START_DATE, END_DATE)
+    try:
+        api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
+    except Exception as e:
+        logger.error(f"Failed to initialize Alpaca API: {e}")
+        raise
+
+    # Perform the backtest
+    results, trades, executions = backtest(api, START_DATE, END_DATE)
 
     if results is not None and not results.empty:
+        # Calculate performance metrics
         metrics = performance_metrics(results, trades)
         print("Backtest Results:")
         print(results.tail())
+
         print("\nPerformance Metrics:")
         for k, v in metrics.items():
             if pd.notnull(v):
-                if k in ['CAGR', 'Max Drawdown', 'Total Return', 'Sortino', 'Calmar Ratio']:
+                if k in ['CAGR', 'Max Drawdown', 'Total Return']:
                     # These metrics make sense as percentages
                     print(f"{k}: {v:.2%}")
-                elif k in ['Sharpe', 'Sortino', 'Calmar Ratio']:
+                elif k in ['Sharpe', 'Sortino', 'Calmar Ratio', 'Profit Factor']:
                     # Ratios should be printed as normal floats
                     print(f"{k}: {v:.2f}")
                 elif k == 'Max Drawdown Duration (days)':
                     print(f"{k}: {v} days")
                 elif k == 'Win Rate':
                     print(f"{k}: {v:.2%}")
-                elif k == 'Profit Factor':
+                elif k == 'Average Trade Profit/Loss':
                     print(f"{k}: {v:.2f}")
                 else:
                     print(f"{k}: {v}")
@@ -586,14 +744,35 @@ if __name__ == "__main__":
                 print(f"{k}: N/A")
 
         # Plot equity curve
-        results['equity'].plot(title='Equity Curve', figsize=(10, 6))
+        plt.figure(figsize=(10, 6))
+        plt.plot(results.index, results['Equity'], label='Equity Curve', color='blue')
+        plt.title('Equity Curve', fontsize=16)
+        plt.xlabel('Date', fontsize=14)
+        plt.ylabel('Equity ($)', fontsize=14)
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
         plt.show()
 
-        # Optionally, analyze trade log
+        # Detailed Execution Log
+        if executions:
+            print("\nDetailed Execution Log:")
+            execution_df = pd.DataFrame(executions)
+            pd.set_option('display.max_rows', None)
+            print(execution_df)
+            pd.set_option('display.max_rows', 10)  # Reset to default
+
+            # Save Execution Log to CSV
+            execution_df.to_csv('execution_log.csv', index=False)
+            print("\nExecution log saved to 'execution_log.csv'.")
+
+        # Trade Summary Log
         if trades:
-            print("\nTrade Log:")
+            print("\nTrade Summary Log:")
             trade_df = pd.DataFrame(trades)
             print(trade_df)
+            trade_df.to_csv('trade_summary_log.csv', index=False)
+            print("\nTrade summary log saved to 'trade_summary_log.csv'.")
     else:
         logger.warning("No results. Check data retrieval or parameters.")
         print("No results. Check data retrieval or parameters.")
