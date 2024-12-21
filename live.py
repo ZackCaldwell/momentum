@@ -219,14 +219,58 @@ def get_universe(api, start_date, end_date, universe_size=UNIVERSE_SIZE, min_avg
     return [str(sym) for sym in selected]
 
 def calculate_momentum(prices, lookback=LOOKBACK_PERIOD):
-    return prices.pct_change(lookback, fill_method=None).iloc[-1]
+    """
+    Calculate momentum based on the average of past N daily returns.
+
+    Parameters:
+    - prices (pd.DataFrame): DataFrame of price data with dates as index and symbols as columns.
+    - lookback (int): Number of periods to look back.
+
+    Returns:
+    - momentum (pd.Series): Normalized momentum scores for each symbol.
+    """
+    # Calculate daily returns
+    daily_returns = prices.pct_change()
+
+    # Calculate the average return over the lookback period
+    avg_momentum = daily_returns.rolling(window=lookback).mean().iloc[-1]
+
+    # Drop symbols with insufficient data
+    avg_momentum = avg_momentum.dropna()
+
+    # Rank the momentum scores in descending order (higher momentum gets a higher rank)
+    momentum_rank = avg_momentum.rank(ascending=False, na_option='bottom')
+
+    # Normalize the momentum ranks to have values between 0 and 1
+    momentum_score = momentum_rank / momentum_rank.max()
+
+    return momentum_score
 
 def select_stocks(prices, n=NUM_STOCKS, lookback=LOOKBACK_PERIOD):
+    """
+    Select top N stocks based on momentum scores.
+
+    Parameters:
+    - prices (pd.DataFrame): DataFrame of price data with dates as index and symbols as columns.
+    - n (int): Number of top stocks to select.
+    - lookback (int): Number of periods to look back for momentum calculation.
+
+    Returns:
+    - selected (list): List of selected stock symbols.
+    """
     mom = calculate_momentum(prices, lookback=lookback)
     mom = mom.dropna()
+
     if mom.empty:
+        logger.debug("Momentum scores are empty after dropping NaNs.")
         return []
-    return mom.sort_values(ascending=False).head(n).index.tolist()
+
+    # Sort the momentum scores in descending order and select the top N
+    selected = mom.sort_values(ascending=False).head(n).index.tolist()
+
+    logger.debug(f"Selected stocks based on momentum: {selected}")
+
+    return selected
 
 def volatility_scale(prices, selected_stocks, lookback=LOOKBACK_PERIOD):
     returns = prices[selected_stocks].pct_change().dropna()
