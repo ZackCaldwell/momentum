@@ -28,19 +28,19 @@ logger = logging.getLogger(__name__)
 # Alpaca API credentials and endpoint
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets"  # Change to paper URL for testing
+ALPACA_BASE_URL = "https://paper-api.alpaca.markets"  # Change to live URL for live trading
 
-# Trading Parameters
-LOOKBACK_PERIOD = 42
-REBALANCE_FREQ = 'M'  # 'M' for Monthly, 'W' for Weekly
+# Trading Parameters (Updated Configuration)
+LOOKBACK_PERIOD = 30           # Updated lookback period
+REBALANCE_FREQ = 'W'           # Weekly rebalance
 NUM_STOCKS = 10
 INITIAL_CASH = 20000
-MAX_POSITION_SIZE = 0.1  # 10% of portfolio per position
+MAX_POSITION_SIZE = 0.1        # 10% of portfolio per position
 
-# Universe Selection Parameters
-UNIVERSE_SIZE = 200
-MIN_AVG_VOL = 5_000_000
-MIN_PRICE = 20.0
+# Universe Selection Parameters (Updated Configuration)
+UNIVERSE_SIZE = 250
+MIN_AVG_VOL = 6_000_000         # Updated minimum average volume
+MIN_PRICE = 20.0                # Updated minimum stock price
 
 # Trading Costs and Slippage
 COMMISSION_PER_TRADE = 1.0
@@ -48,8 +48,8 @@ SLIPPAGE_BPS = 10
 
 # Risk Management Parameters
 STOP_LOSS_FACTOR = 0.9
-TAKE_PROFIT_FACTOR = 1.5  # Sell half if up > 50%
-MIN_HOLD_DAYS = 30  # Minimum holding period in days
+TAKE_PROFIT_FACTOR = 1.5       # Sell half if up > 50%
+MIN_HOLD_DAYS = 30              # Minimum holding period in days
 
 # Market Regime Symbol
 MARKET_REGIME_SYMBOL = 'SPY'
@@ -119,6 +119,10 @@ def send_email(subject, body):
 #####################################################################
 
 def get_bars(api, symbols, start_date, end_date, timeframe='1Day'):
+    """
+    Fetches historical bars for the given symbols between start_date and end_date.
+    Utilizes caching to store and retrieve fetched data.
+    """
     symbols = [str(s) for s in symbols if isinstance(s, str) or not pd.isnull(s)]
     logger.debug(f"Requesting bars for {len(symbols)} symbols from {start_date} to {end_date}.")
     if len(symbols) == 0:
@@ -147,30 +151,30 @@ def get_bars(api, symbols, start_date, end_date, timeframe='1Day'):
             logger.debug(f"No data returned for chunk {idx}")
             continue
 
-        if 'symbol' not in bars.index.names:
-            if 'symbol' in bars.columns:
-                if 'timestamp' not in bars.columns:
-                    if 'timestamp' in bars.index.names:
-                        bars = bars.reset_index()
-                if 'symbol' in bars.columns and 'timestamp' in bars.columns:
-                    bars = bars.set_index(['symbol', 'timestamp']).sort_index()
-                else:
-                    if len(chunk) == 1:
-                        sym = chunk[0]
-                        if bars.index.name == 'timestamp':
-                            bars['symbol'] = sym
-                            bars = bars.reset_index().set_index(['symbol', 'timestamp']).sort_index()
-                        else:
-                            logger.warning("No suitable timestamp column found for single-symbol fallback.")
-                            continue
-                    else:
-                        logger.warning(
-                            "Multiple symbols requested but no 'symbol' and 'timestamp' columns after reset.")
-                        continue
-
+        # Ensure 'symbol' and 'timestamp' are part of the index
         if 'symbol' not in bars.index.names or 'timestamp' not in bars.index.names:
-            logger.warning("Unable to set multi-index. Data may not be usable.")
-            continue
+            logger.warning("Data does not have both 'symbol' and 'timestamp' as index levels.")
+            # Attempt to reset index if possible
+            if 'symbol' in bars.columns and 'timestamp' in bars.columns:
+                bars = bars.set_index(['symbol', 'timestamp']).sort_index()
+                logger.debug("Set 'symbol' and 'timestamp' as MultiIndex after resetting.")
+            elif 'symbol' in bars.columns and 'time' in bars.columns:
+                bars.rename(columns={'time': 'timestamp'}, inplace=True)
+                bars = bars.set_index(['symbol', 'timestamp']).sort_index()
+                logger.debug("Renamed 'time' to 'timestamp' and set MultiIndex.")
+            elif 'time' in bars.columns:
+                bars = bars.reset_index().rename(columns={'time': 'timestamp'})
+                # Assuming all bars in chunk belong to the same symbol
+                for sym in chunk:
+                    sym_bars = bars[bars['symbol'] == sym]
+                    if sym_bars.empty:
+                        continue
+                    sym_bars = sym_bars.set_index(['symbol', 'timestamp']).sort_index()
+                    all_data.append(sym_bars)
+                continue
+            else:
+                logger.warning("Cannot set 'symbol' and 'timestamp' as MultiIndex. Skipping chunk.")
+                continue
 
         all_data.append(bars)
 
@@ -183,6 +187,10 @@ def get_bars(api, symbols, start_date, end_date, timeframe='1Day'):
     return data
 
 def get_universe(api, start_date, end_date, universe_size=UNIVERSE_SIZE, min_avg_vol=MIN_AVG_VOL, min_price=MIN_PRICE):
+    """
+    Selects the universe based on historical data up to the current_date.
+    Ensures no future data leakage by selecting based on data available up to the rebalance date.
+    """
     logger.debug("Fetching active assets from Alpaca.")
     try:
         active_assets = [a for a in api.list_assets(status='active') if a.tradable and a.exchange in ['NYSE', 'NASDAQ']]
@@ -190,44 +198,48 @@ def get_universe(api, start_date, end_date, universe_size=UNIVERSE_SIZE, min_avg
         logger.error(f"Error fetching active assets: {e}")
         return []
 
-    symbols = [a.symbol for a in active_assets if a.easy_to_borrow and a.shortable]
+    symbols = [a.symbol for a in active_assets]
 
-    end_dt = pd.Timestamp(end_date, tz='UTC')
-    start_dt = end_dt - pd.Timedelta(days=30)
-    start_universe_str = start_dt.strftime('%Y-%m-%d')
-    end_universe_str = end_dt.strftime('%Y-%m-%d')
+    # Fetch historical bars for universe selection
+    lookback_days = LOOKBACK_PERIOD * 2  # Adjust as needed
+    start_universe_dt = pd.Timestamp(end_date) - pd.Timedelta(days=lookback_days)
+    start_universe_str = start_universe_dt.strftime('%Y-%m-%d')
+    end_universe_str = pd.Timestamp(end_date).strftime('%Y-%m-%d')
 
+    logger.debug(f"Fetching bars for universe selection from {start_universe_str} to {end_universe_str}.")
     barset = get_bars(api, symbols, start_universe_str, end_universe_str, timeframe='1Day')
     if barset.empty:
+        logger.warning("No price data fetched for universe selection.")
         return []
 
+    # Calculate average volume
     avg_vol = barset.groupby(level=0)['volume'].mean()
     liquid_symbols = avg_vol[avg_vol > min_avg_vol].index.tolist()
     if len(liquid_symbols) == 0:
+        logger.warning("No liquid symbols found based on average volume criteria.")
         return []
 
+    # Get the last available close price up to the end_date
     last_day_data = barset.groupby(level=0).tail(1)
     last_day_close = last_day_data['close']
     viable = last_day_close[last_day_close > min_price].index.unique()
     viable_symbols = viable.get_level_values(0).unique()
-    liquid_symbols = list(set(liquid_symbols).intersection(set(viable_symbols)))
-    if len(liquid_symbols) == 0:
+    liquid_viable_symbols = list(set(liquid_symbols).intersection(set(viable_symbols)))
+
+    if len(liquid_viable_symbols) == 0:
+        logger.warning("No symbols passed the volume and price filters.")
         return []
 
-    avg_vol_filtered = avg_vol.loc[liquid_symbols].sort_values(ascending=False)
+    # Sort by average volume and select top N
+    avg_vol_filtered = avg_vol.loc[liquid_viable_symbols].sort_values(ascending=False)
     selected = avg_vol_filtered.head(universe_size).index.tolist()
+
+    logger.debug(f"Selected {len(selected)} symbols for the universe based on volume and price criteria.")
     return [str(sym) for sym in selected]
 
 def calculate_momentum(prices, lookback=LOOKBACK_PERIOD):
     """
     Calculate momentum based on the average of past N daily returns.
-
-    Parameters:
-    - prices (pd.DataFrame): DataFrame of price data with dates as index and symbols as columns.
-    - lookback (int): Number of periods to look back.
-
-    Returns:
-    - momentum (pd.Series): Normalized momentum scores for each symbol.
     """
     # Calculate daily returns
     daily_returns = prices.pct_change()
@@ -249,14 +261,6 @@ def calculate_momentum(prices, lookback=LOOKBACK_PERIOD):
 def select_stocks(prices, n=NUM_STOCKS, lookback=LOOKBACK_PERIOD):
     """
     Select top N stocks based on momentum scores.
-
-    Parameters:
-    - prices (pd.DataFrame): DataFrame of price data with dates as index and symbols as columns.
-    - n (int): Number of top stocks to select.
-    - lookback (int): Number of periods to look back for momentum calculation.
-
-    Returns:
-    - selected (list): List of selected stock symbols.
     """
     mom = calculate_momentum(prices, lookback=lookback)
     mom = mom.dropna()
@@ -273,6 +277,9 @@ def select_stocks(prices, n=NUM_STOCKS, lookback=LOOKBACK_PERIOD):
     return selected
 
 def volatility_scale(prices, selected_stocks, lookback=LOOKBACK_PERIOD):
+    """
+    Scale the target weights based on inverse volatility.
+    """
     returns = prices[selected_stocks].pct_change().dropna()
     recent_returns = returns.tail(lookback)
     vol = recent_returns.std() * np.sqrt(252)
@@ -288,16 +295,21 @@ def volatility_scale(prices, selected_stocks, lookback=LOOKBACK_PERIOD):
 
 def rebalance_portfolio(current_positions, target_weights, current_prices, portfolio_value, entry_prices,
                         position_entry_dates, current_date):
+    """
+    Determines the trades needed to rebalance the portfolio to the target weights,
+    considering stop-loss, take-profit, and minimum holding periods.
+    """
     logger.debug("Rebalancing portfolio.")
     trades = {}
 
+    # Normalize weights if necessary
     sum_weights = sum(target_weights.values())
     if sum_weights > 1:
         factor = 1.0 / sum_weights
         target_weights = {k: v * factor for k, v in target_weights.items()}
     target_weights = {k: min(v, MAX_POSITION_SIZE) for k, v in target_weights.items()}
 
-    # Check stop-loss and holding period (no selling if held < MIN_HOLD_DAYS)
+    # Check stop-loss and take-profit conditions
     for sym in list(current_positions.keys()):
         if sym in entry_prices:
             current_price = current_prices.get(sym, np.nan)
@@ -311,7 +323,7 @@ def rebalance_portfolio(current_positions, target_weights, current_prices, portf
                         trades[sym] = shares_to_trade
                         if sym in target_weights:
                             del target_weights[sym]
-                # Take-profit: if up > 50%, sell half (also only if minimum hold period passed)
+                # Take-profit: if up > 50%, sell half (only if minimum hold period passed)
                 elif current_price > entry_price * TAKE_PROFIT_FACTOR and held_days >= MIN_HOLD_DAYS:
                     # Sell half the position
                     shares_to_trade = -int(current_positions[sym] / 2)
@@ -353,20 +365,8 @@ def rebalance_portfolio(current_positions, target_weights, current_prices, portf
 def get_rebalance_dates(close_prices, freq=REBALANCE_FREQ):
     """
     Determines the rebalance dates based on the specified frequency.
-
-    Parameters:
-    - close_prices (pd.DataFrame): DataFrame containing close prices with a DateTime index.
-    - freq (str): Rebalance frequency code. Supported values:
-        'W'  : Weekly (default day: Monday)
-        'MS' : Monthly Start
-        'QS' : Quarterly Start
-        'AS' : Annually Start
-        'YS' : Another Annually Start alias
-
-    Returns:
-    - rebal_dates (list of pd.Timestamp): List of dates to rebalance the portfolio.
     """
-    # Map common frequency codes to pandas period frequencies
+    # Map frequency codes
     freq_map = {
         'W': 'W-MON',  # Weekly on Monday
         'MS': 'M',      # Monthly Start
@@ -375,7 +375,6 @@ def get_rebalance_dates(close_prices, freq=REBALANCE_FREQ):
         'YS': 'A'       # Another Annually Start alias
     }
 
-    # Get the corresponding pandas frequency string, default to monthly if unknown
     period_freq = freq_map.get(freq, 'M')  # Default to monthly if unknown
 
     # Convert the index to the specified period frequency
@@ -493,9 +492,11 @@ def rebalance(api, current_date, state):
         send_email("Rebalance Warning", "No price data fetched during rebalance.")
         return
 
+    # Extract 'close' prices
     close_prices = prices_data['close'].unstack(level=0)
     close_prices = close_prices.dropna(axis=1, how='all')
 
+    # Select stocks based on momentum
     selected = select_stocks(close_prices, n=NUM_STOCKS, lookback=LOOKBACK_PERIOD)
     if not selected:
         logger.warning("No stocks selected by the strategy.")
@@ -539,7 +540,7 @@ def rebalance(api, current_date, state):
         if qty > 0:
             order_id = place_order(sym, qty, 'buy')
             if order_id:
-                # Optionally, place stop-loss and take-profit orders
+                # Place stop-loss and take-profit orders
                 entry_price = close_prices[sym].iloc[-1]
                 stop_price = entry_price * STOP_LOSS_FACTOR
                 limit_price = entry_price * TAKE_PROFIT_FACTOR
@@ -606,7 +607,7 @@ def main():
             if seconds_until_next_run < 0:
                 seconds_until_next_run += 86400  # Add a day in seconds
 
-            logger.info(f"Sleeping for {seconds_until_next_run} seconds until next check.")
+            logger.info(f"Sleeping for {int(seconds_until_next_run)} seconds until next check.")
             time.sleep(seconds_until_next_run)
 
         except Exception as e:
